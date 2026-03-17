@@ -10,7 +10,7 @@
     "dotenv": "^16.0.0",
     "express": "^4.18.2",
     "jsqr": "^1.4.0",
-    "sharp": "^0.34.4",
-    "slipverify": "latest"
+    "promptparse": "^1.5.0",
+    "sharp": "^0.34.4"
   }
 }
