@@ -3,7 +3,7 @@ const express = require('express');
 const axios = require('axios');
 const sharp = require('sharp');
 const jsQR = require('jsqr');
-const { inquiry } = require('slipverify');
+const { slipVerify } = require('promptparse/validate');
 
 const app = express();
 app.use(express.json());
@@ -58,51 +58,74 @@ async function decodeQrFromBuffer(imageBuffer) {
 }
 
 // ------------------------
-// Verify with slipverify + KBANK
+// KBANK OAuth
 // ------------------------
-async function verifySlipWithKbank(qrPayload) {
-  const result = await inquiry({
-    provider: 'kbank',
-    clientId: process.env.KBANK_CLIENT_ID,
-    clientSecret: process.env.KBANK_CLIENT_SECRET,
-    payload: qrPayload
-  });
+async function getKbankToken() {
+  const basic = Buffer.from(
+    `${process.env.KBANK_CLIENT_ID}:${process.env.KBANK_CLIENT_SECRET}`
+  ).toString('base64');
 
-  return result;
+  const response = await axios.post(
+    'https://openapi-sandbox.kasikornbank.com/v2/oauth/token',
+    'grant_type=client_credentials',
+    {
+      headers: {
+        Authorization: `Basic ${basic}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'x-test-mode': 'true',
+        'env-id': 'OAUTH2'
+      }
+    }
+  );
+
+  return response.data.access_token;
 }
 
 // ------------------------
-// Optional: format result
+// KBANK inquiry
+// NOTE: this body may need one small tweak depending on your exact KBANK product
 // ------------------------
-function formatVerificationMessage(result) {
-  if (!result) {
-    return '❌ Verification failed';
-  }
+async function inquiryKbankWithParsedSlip(parsedSlip) {
+  const token = await getKbankToken();
 
-  // keep this defensive because provider response shapes can vary
+  const requestBody = {
+    sendingBank: parsedSlip.sendingBank,
+    transRef: parsedSlip.transRef,
+    sender: parsedSlip.sender,
+    receiver: parsedSlip.receiver,
+    amount: parsedSlip.amount
+  };
+
+  const response = await axios.post(
+    'https://openapi-sandbox.kasikornbank.com/v1/slip/verify',
+    requestBody,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'x-test-mode': 'true'
+      }
+    }
+  );
+
+  return response.data;
+}
+
+function formatResult(parsedSlip, bankResult) {
   const lines = [];
 
-  if (result.valid === true) {
-    lines.push('✅ Slip verified');
-  } else if (result.valid === false) {
-    lines.push('❌ Slip invalid');
-  } else {
-    lines.push('ℹ️ Verification completed');
-  }
+  lines.push('✅ Slip processed');
 
-  if (result.amount) lines.push(`Amount: ${result.amount}`);
-  if (result.transRef) lines.push(`Ref: ${result.transRef}`);
-  if (result.receiver?.name) lines.push(`Receiver: ${result.receiver.name}`);
-  if (result.sender?.name) lines.push(`Sender: ${result.sender.name}`);
-  if (result.date) lines.push(`Date: ${result.date}`);
-  if (result.time) lines.push(`Time: ${result.time}`);
+  if (parsedSlip.amount) lines.push(`Amount: ${parsedSlip.amount}`);
+  if (parsedSlip.transRef) lines.push(`Ref: ${parsedSlip.transRef}`);
+  if (parsedSlip.sendingBank) lines.push(`Bank: ${parsedSlip.sendingBank}`);
+
+  if (bankResult?.status) lines.push(`Status: ${bankResult.status}`);
+  if (bankResult?.statusCode) lines.push(`Code: ${bankResult.statusCode}`);
 
   return lines.join('\n');
 }
 
-// ------------------------
-// Health checks
-// ------------------------
 app.get('/', (req, res) => {
   res.send('Bot is running');
 });
@@ -111,14 +134,10 @@ app.get('/webhook', (req, res) => {
   res.send('Webhook is alive. Use POST.');
 });
 
-// ------------------------
-// Main webhook
-// ------------------------
 app.post('/webhook', async (req, res) => {
   console.log('=== WEBHOOK HIT ===');
   console.log(JSON.stringify(req.body, null, 2));
 
-  // respond to LINE immediately
   res.sendStatus(200);
 
   try {
@@ -128,16 +147,11 @@ app.post('/webhook', async (req, res) => {
       if (event.type !== 'message') continue;
       if (!event.replyToken) continue;
 
-      // text messages
       if (event.message.type === 'text') {
-        await replyMessage(
-          event.replyToken,
-          'Send me a payment slip image.'
-        );
+        await replyMessage(event.replyToken, 'Send me a payment slip image.');
         continue;
       }
 
-      // image messages
       if (event.message.type === 'image') {
         try {
           const messageId = event.message.id;
@@ -157,13 +171,29 @@ app.post('/webhook', async (req, res) => {
             continue;
           }
 
-          const result = await verifySlipWithKbank(qrPayload);
-          console.log('Verification result:', JSON.stringify(result, null, 2));
+          const parsedSlip = slipVerify(qrPayload);
+          console.log('Parsed slip:', parsedSlip);
 
-          const message = formatVerificationMessage(result);
-          await replyMessage(event.replyToken, message);
+          if (!parsedSlip) {
+            await replyMessage(
+              event.replyToken,
+              '❌ QR found, but it is not a valid Thai slip QR payload.'
+            );
+            continue;
+          }
+
+          const bankResult = await inquiryKbankWithParsedSlip(parsedSlip);
+          console.log('KBANK result:', JSON.stringify(bankResult, null, 2));
+
+          await replyMessage(
+            event.replyToken,
+            formatResult(parsedSlip, bankResult)
+          );
         } catch (imageErr) {
-          console.error('IMAGE FLOW ERROR:', imageErr.response?.data || imageErr.message || imageErr);
+          console.error(
+            'IMAGE FLOW ERROR:',
+            imageErr.response?.data || imageErr.message || imageErr
+          );
 
           await replyMessage(
             event.replyToken,
@@ -174,10 +204,7 @@ app.post('/webhook', async (req, res) => {
         continue;
       }
 
-      await replyMessage(
-        event.replyToken,
-        'Please send a payment slip image.'
-      );
+      await replyMessage(event.replyToken, 'Please send a payment slip image.');
     }
   } catch (err) {
     console.error('WEBHOOK ERROR:', err.response?.data || err.message || err);
