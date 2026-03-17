@@ -1,23 +1,22 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const fs = require('fs');
+const sharp = require('sharp');
+const jsQR = require('jsqr');
+const { inquiry } = require('slipverify');
 
 const app = express();
 app.use(express.json());
 
-// Send reply back to LINE user
+// ------------------------
+// LINE reply helper
+// ------------------------
 async function replyMessage(replyToken, text) {
-  const response = await axios.post(
+  return axios.post(
     'https://api.line.me/v2/bot/message/reply',
     {
       replyToken,
-      messages: [
-        {
-          type: 'text',
-          text
-        }
-      ]
+      messages: [{ type: 'text', text }]
     },
     {
       headers: {
@@ -26,11 +25,11 @@ async function replyMessage(replyToken, text) {
       }
     }
   );
-
-  return response.data;
 }
 
-// Download image/file content from LINE using message ID
+// ------------------------
+// Download image from LINE
+// ------------------------
 async function getImageBuffer(messageId) {
   const response = await axios.get(
     `https://api-data.line.me/v2/bot/message/${messageId}/content`,
@@ -45,74 +44,143 @@ async function getImageBuffer(messageId) {
   return Buffer.from(response.data);
 }
 
+// ------------------------
+// Decode QR from image
+// ------------------------
+async function decodeQrFromBuffer(imageBuffer) {
+  const { data, info } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const qr = jsQR(new Uint8ClampedArray(data), info.width, info.height);
+  return qr ? qr.data : null;
+}
+
+// ------------------------
+// Verify with slipverify + KBANK
+// ------------------------
+async function verifySlipWithKbank(qrPayload) {
+  const result = await inquiry({
+    provider: 'kbank',
+    clientId: process.env.KBANK_CLIENT_ID,
+    clientSecret: process.env.KBANK_CLIENT_SECRET,
+    payload: qrPayload
+  });
+
+  return result;
+}
+
+// ------------------------
+// Optional: format result
+// ------------------------
+function formatVerificationMessage(result) {
+  if (!result) {
+    return '❌ Verification failed';
+  }
+
+  // keep this defensive because provider response shapes can vary
+  const lines = [];
+
+  if (result.valid === true) {
+    lines.push('✅ Slip verified');
+  } else if (result.valid === false) {
+    lines.push('❌ Slip invalid');
+  } else {
+    lines.push('ℹ️ Verification completed');
+  }
+
+  if (result.amount) lines.push(`Amount: ${result.amount}`);
+  if (result.transRef) lines.push(`Ref: ${result.transRef}`);
+  if (result.receiver?.name) lines.push(`Receiver: ${result.receiver.name}`);
+  if (result.sender?.name) lines.push(`Sender: ${result.sender.name}`);
+  if (result.date) lines.push(`Date: ${result.date}`);
+  if (result.time) lines.push(`Time: ${result.time}`);
+
+  return lines.join('\n');
+}
+
+// ------------------------
+// Health checks
+// ------------------------
 app.get('/', (req, res) => {
   res.send('Bot is running');
 });
 
 app.get('/webhook', (req, res) => {
-  res.send('Webhook is alive. LINE must use POST here.');
+  res.send('Webhook is alive. Use POST.');
 });
 
+// ------------------------
+// Main webhook
+// ------------------------
 app.post('/webhook', async (req, res) => {
   console.log('=== WEBHOOK HIT ===');
   console.log(JSON.stringify(req.body, null, 2));
 
-  // Important: respond to LINE fast
+  // respond to LINE immediately
   res.sendStatus(200);
 
   try {
     const events = req.body.events || [];
 
     for (const event of events) {
-      console.log('Event type:', event.type);
-
       if (event.type !== 'message') continue;
       if (!event.replyToken) continue;
 
+      // text messages
       if (event.message.type === 'text') {
-        console.log('Text message received');
-
         await replyMessage(
           event.replyToken,
-          'Bot is working. Send me a payment slip image.'
+          'Send me a payment slip image.'
         );
-
-        console.log('Text reply sent successfully');
-      } else if (event.message.type === 'image') {
-        console.log('Image received');
-
-        const messageId = event.message.id;
-        console.log('Message ID:', messageId);
-
-        // Download image from LINE
-        const imageBuffer = await getImageBuffer(messageId);
-        console.log('Downloaded image size:', imageBuffer.length);
-
-        // Optional: save image temporarily on server
-        const filePath = `/tmp/${messageId}.jpg`;
-        fs.writeFileSync(filePath, imageBuffer);
-        console.log('Image saved to:', filePath);
-
-        await replyMessage(
-          event.replyToken,
-          'Received your slip. Image downloaded successfully.'
-        );
-
-        console.log('Image reply sent successfully');
-      } else {
-        console.log('Other message type:', event.message.type);
-
-        await replyMessage(
-          event.replyToken,
-          'Please send text or an image.'
-        );
-
-        console.log('Fallback reply sent successfully');
+        continue;
       }
+
+      // image messages
+      if (event.message.type === 'image') {
+        try {
+          const messageId = event.message.id;
+          console.log('Image message ID:', messageId);
+
+          const imageBuffer = await getImageBuffer(messageId);
+          console.log('Downloaded bytes:', imageBuffer.length);
+
+          const qrPayload = await decodeQrFromBuffer(imageBuffer);
+          console.log('QR payload:', qrPayload);
+
+          if (!qrPayload) {
+            await replyMessage(
+              event.replyToken,
+              '❌ I could not read the QR code. Please send a clearer slip image.'
+            );
+            continue;
+          }
+
+          const result = await verifySlipWithKbank(qrPayload);
+          console.log('Verification result:', JSON.stringify(result, null, 2));
+
+          const message = formatVerificationMessage(result);
+          await replyMessage(event.replyToken, message);
+        } catch (imageErr) {
+          console.error('IMAGE FLOW ERROR:', imageErr.response?.data || imageErr.message || imageErr);
+
+          await replyMessage(
+            event.replyToken,
+            '❌ Could not verify this slip right now.'
+          );
+        }
+
+        continue;
+      }
+
+      await replyMessage(
+        event.replyToken,
+        'Please send a payment slip image.'
+      );
     }
   } catch (err) {
-    console.error('=== ERROR ===');
-    console.error(err.response?.data || err.message || err);
+    console.error('WEBHOOK ERROR:', err.response?.data || err.message || err);
   }
 });
 
