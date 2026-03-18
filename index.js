@@ -3,16 +3,12 @@ const express = require('express');
 const axios = require('axios');
 const sharp = require('sharp');
 const jsQR = require('jsqr');
-const { slipVerify } = require('promptparse/validate');
 
 const app = express();
 app.use(express.json());
 
-// ------------------------
-// LINE reply helper
-// ------------------------
 async function replyMessage(replyToken, text) {
-  return axios.post(
+  await axios.post(
     'https://api.line.me/v2/bot/message/reply',
     {
       replyToken,
@@ -27,9 +23,6 @@ async function replyMessage(replyToken, text) {
   );
 }
 
-// ------------------------
-// Download image from LINE
-// ------------------------
 async function getImageBuffer(messageId) {
   const response = await axios.get(
     `https://api-data.line.me/v2/bot/message/${messageId}/content`,
@@ -44,9 +37,6 @@ async function getImageBuffer(messageId) {
   return Buffer.from(response.data);
 }
 
-// ------------------------
-// Decode QR from image
-// ------------------------
 async function decodeQrFromBuffer(imageBuffer) {
   const { data, info } = await sharp(imageBuffer)
     .ensureAlpha()
@@ -57,71 +47,56 @@ async function decodeQrFromBuffer(imageBuffer) {
   return qr ? qr.data : null;
 }
 
-// ------------------------
-// KBANK OAuth
-// ------------------------
-async function getKbankToken() {
-  const basic = Buffer.from(
-    `${process.env.KBANK_CLIENT_ID}:${process.env.KBANK_CLIENT_SECRET}`
-  ).toString('base64');
-
+async function verifyWithThunder(qrPayload) {
   const response = await axios.post(
-    'https://openapi-sandbox.kasikornbank.com/v2/oauth/token',
-    'grant_type=client_credentials',
+    'https://api.thunder.in.th/v2/verify/bank',
+    {
+      payload: qrPayload
+    },
     {
       headers: {
-        Authorization: `Basic ${basic}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'x-test-mode': 'true',
-        'env-id': 'OAUTH2'
-      }
-    }
-  );
-
-  return response.data.access_token;
-}
-
-// ------------------------
-// KBANK inquiry
-// NOTE: this body may need one small tweak depending on your exact KBANK product
-// ------------------------
-async function inquiryKbankWithParsedSlip(parsedSlip) {
-  const token = await getKbankToken();
-
-  const requestBody = {
-    sendingBank: parsedSlip.sendingBank,
-    transRef: parsedSlip.transRef,
-    sender: parsedSlip.sender,
-    receiver: parsedSlip.receiver,
-    amount: parsedSlip.amount
-  };
-
-  const response = await axios.post(
-    'https://openapi-sandbox.kasikornbank.com/v1/slip/verify',
-    requestBody,
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        'x-test-mode': 'true'
-      }
+        Authorization: `Bearer ${process.env.THUNDER_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 30000
     }
   );
 
   return response.data;
 }
 
-function formatResult(parsedSlip, bankResult) {
-  const lines = [];
+function formatThunderResult(result) {
+  if (!result || result.success !== true || !result.data || !result.data.rawSlip) {
+    if (result && result.error && result.error.message) {
+      return `❌ ตรวจสอบไม่สำเร็จ\n${result.error.message}`;
+    }
+    return '❌ ตรวจสอบไม่สำเร็จ';
+  }
 
-  lines.push('✅ Slip processed');
+  const slip = result.data.rawSlip;
+  const lines = ['✅ ตรวจสอบสลิปสำเร็จ'];
 
-  if (parsedSlip.amount) lines.push(`Amount: ${parsedSlip.amount}`);
-  if (parsedSlip.transRef) lines.push(`Ref: ${parsedSlip.transRef}`);
-  if (parsedSlip.sendingBank) lines.push(`Bank: ${parsedSlip.sendingBank}`);
+  if (slip.transRef) lines.push(`เลขอ้างอิง: ${slip.transRef}`);
+  if (slip.date) lines.push(`วันที่: ${slip.date}`);
 
-  if (bankResult?.status) lines.push(`Status: ${bankResult.status}`);
-  if (bankResult?.statusCode) lines.push(`Code: ${bankResult.statusCode}`);
+  if (slip.amount && slip.amount.local && slip.amount.local.amount != null) {
+    lines.push(`ยอดเงิน: ${slip.amount.local.amount} ${slip.amount.local.currency || 'THB'}`);
+  } else if (slip.amount && slip.amount.amount != null) {
+    lines.push(`ยอดเงิน: ${slip.amount.amount}`);
+  }
+
+  const senderBank = slip.sender?.bank?.short || slip.sender?.bank?.name;
+  const senderName = slip.sender?.account?.name?.th || slip.sender?.account?.name?.en;
+  const receiverBank = slip.receiver?.bank?.short || slip.receiver?.bank?.name;
+  const receiverName = slip.receiver?.account?.name?.th || slip.receiver?.account?.name?.en;
+
+  if (senderBank || senderName) {
+    lines.push(`ผู้โอน: ${senderName || '-'}${senderBank ? ` (${senderBank})` : ''}`);
+  }
+
+  if (receiverBank || receiverName) {
+    lines.push(`ผู้รับ: ${receiverName || '-'}${receiverBank ? ` (${receiverBank})` : ''}`);
+  }
 
   return lines.join('\n');
 }
@@ -135,9 +110,6 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  console.log('=== WEBHOOK HIT ===');
-  console.log(JSON.stringify(req.body, null, 2));
-
   res.sendStatus(200);
 
   try {
@@ -148,7 +120,10 @@ app.post('/webhook', async (req, res) => {
       if (!event.replyToken) continue;
 
       if (event.message.type === 'text') {
-        await replyMessage(event.replyToken, 'Send me a payment slip image.');
+        await replyMessage(
+          event.replyToken,
+          'ส่งรูปสลิปมาได้เลย'
+        );
         continue;
       }
 
@@ -166,45 +141,34 @@ app.post('/webhook', async (req, res) => {
           if (!qrPayload) {
             await replyMessage(
               event.replyToken,
-              '❌ I could not read the QR code. Please send a clearer slip image.'
+              '❌ อ่าน QR ไม่ได้ กรุณาส่งรูปสลิปที่ชัดกว่านี้'
             );
             continue;
           }
 
-          const parsedSlip = slipVerify(qrPayload);
-          console.log('Parsed slip:', parsedSlip);
+          const thunderResult = await verifyWithThunder(qrPayload);
+          console.log('Thunder result:', JSON.stringify(thunderResult, null, 2));
 
-          if (!parsedSlip) {
-            await replyMessage(
-              event.replyToken,
-              '❌ QR found, but it is not a valid Thai slip QR payload.'
-            );
-            continue;
+          const message = formatThunderResult(thunderResult);
+          await replyMessage(event.replyToken, message);
+        } catch (err) {
+          console.error('IMAGE FLOW ERROR:', err.response?.data || err.message || err);
+
+          let msg = '❌ ตรวจสอบสลิปไม่ได้ในตอนนี้';
+          if (err.response?.data?.error?.message) {
+            msg = `❌ ${err.response.data.error.message}`;
           }
 
-          const bankResult = await inquiryKbankWithParsedSlip(parsedSlip);
-          console.log('KBANK result:', JSON.stringify(bankResult, null, 2));
-
-          await replyMessage(
-            event.replyToken,
-            formatResult(parsedSlip, bankResult)
-          );
-        } catch (imageErr) {
-          console.error(
-            'IMAGE FLOW ERROR:',
-            imageErr.response?.data || imageErr.message || imageErr
-          );
-
-          await replyMessage(
-            event.replyToken,
-            '❌ Could not verify this slip right now.'
-          );
+          await replyMessage(event.replyToken, msg);
         }
 
         continue;
       }
 
-      await replyMessage(event.replyToken, 'Please send a payment slip image.');
+      await replyMessage(
+        event.replyToken,
+        'กรุณาส่งเป็นรูปสลิป'
+      );
     }
   } catch (err) {
     console.error('WEBHOOK ERROR:', err.response?.data || err.message || err);
