@@ -1,12 +1,14 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const sharp = require('sharp');
-const jsQR = require('jsqr');
+const FormData = require('form-data');
 
 const app = express();
 app.use(express.json());
 
+// ------------------------
+// Reply to LINE
+// ------------------------
 async function replyMessage(replyToken, text) {
   await axios.post(
     'https://api.line.me/v2/bot/message/reply',
@@ -23,6 +25,9 @@ async function replyMessage(replyToken, text) {
   );
 }
 
+// ------------------------
+// Download image from LINE
+// ------------------------
 async function getImageBuffer(messageId) {
   const response = await axios.get(
     `https://api-data.line.me/v2/bot/message/${messageId}/content`,
@@ -37,26 +42,25 @@ async function getImageBuffer(messageId) {
   return Buffer.from(response.data);
 }
 
-async function decodeQrFromBuffer(imageBuffer) {
-  const { data, info } = await sharp(imageBuffer)
-    .ensureAlpha()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
+// ------------------------
+// Thunder verify (IMAGE)
+// ------------------------
+async function verifyWithThunder(imageBuffer) {
+  console.log('Thunder key loaded:', process.env.THUNDER_API_KEY);
 
-  const qr = jsQR(new Uint8ClampedArray(data), info.width, info.height);
-  return qr ? qr.data : null;
-}
+  const form = new FormData();
+  form.append('image', imageBuffer, {
+    filename: 'slip.jpg',
+    contentType: 'image/jpeg'
+  });
 
-async function verifyWithThunder(qrPayload) {
   const response = await axios.post(
     'https://api.thunder.in.th/v2/verify/bank',
-    {
-      payload: qrPayload
-    },
+    form,
     {
       headers: {
         Authorization: `Bearer ${process.env.THUNDER_API_KEY}`,
-        'Content-Type': 'application/json'
+        ...form.getHeaders()
       },
       timeout: 30000
     }
@@ -65,50 +69,68 @@ async function verifyWithThunder(qrPayload) {
   return response.data;
 }
 
-function formatThunderResult(result) {
-  if (!result || result.success !== true || !result.data || !result.data.rawSlip) {
-    if (result && result.error && result.error.message) {
-      return `❌ ตรวจสอบไม่สำเร็จ\n${result.error.message}`;
-    }
-    return '❌ ตรวจสอบไม่สำเร็จ';
+// ------------------------
+// Format result
+// ------------------------
+function formatResult(result) {
+  if (!result || result.success !== true) {
+    return `❌ ${result?.error?.message || 'Verification failed'}`;
   }
 
   const slip = result.data.rawSlip;
-  const lines = ['✅ ตรวจสอบสลิปสำเร็จ'];
+  const lines = ['✅ Slip verified'];
 
-  if (slip.transRef) lines.push(`เลขอ้างอิง: ${slip.transRef}`);
-  if (slip.date) lines.push(`วันที่: ${slip.date}`);
+  if (result.data.amountInSlip)
+    lines.push(`Amount: ${result.data.amountInSlip} THB`);
 
-  if (slip.amount && slip.amount.local && slip.amount.local.amount != null) {
-    lines.push(`ยอดเงิน: ${slip.amount.local.amount} ${slip.amount.local.currency || 'THB'}`);
-  } else if (slip.amount && slip.amount.amount != null) {
-    lines.push(`ยอดเงิน: ${slip.amount.amount}`);
-  }
+  if (slip?.transRef)
+    lines.push(`Ref: ${slip.transRef}`);
 
-  const senderBank = slip.sender?.bank?.short || slip.sender?.bank?.name;
-  const senderName = slip.sender?.account?.name?.th || slip.sender?.account?.name?.en;
-  const receiverBank = slip.receiver?.bank?.short || slip.receiver?.bank?.name;
-  const receiverName = slip.receiver?.account?.name?.th || slip.receiver?.account?.name?.en;
+  const sender = slip?.sender?.account?.name?.th;
+  const receiver = slip?.receiver?.account?.name?.th;
 
-  if (senderBank || senderName) {
-    lines.push(`ผู้โอน: ${senderName || '-'}${senderBank ? ` (${senderBank})` : ''}`);
-  }
-
-  if (receiverBank || receiverName) {
-    lines.push(`ผู้รับ: ${receiverName || '-'}${receiverBank ? ` (${receiverBank})` : ''}`);
-  }
+  if (sender) lines.push(`Sender: ${sender}`);
+  if (receiver) lines.push(`Receiver: ${receiver}`);
 
   return lines.join('\n');
 }
 
+// ------------------------
+// TEST ROUTE (IMPORTANT)
+// ------------------------
+app.get('/test-thunder-auth', async (req, res) => {
+  try {
+    const response = await axios.get(
+      'https://api.thunder.in.th/v2/info',
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.THUNDER_API_KEY}`
+        }
+      }
+    );
+
+    res.json(response.data);
+  } catch (err) {
+    res.status(err.response?.status || 500).json(
+      err.response?.data || { message: err.message }
+    );
+  }
+});
+
+// ------------------------
+// Basic routes
+// ------------------------
 app.get('/', (req, res) => {
   res.send('Bot is running');
 });
 
 app.get('/webhook', (req, res) => {
-  res.send('Webhook is alive. Use POST.');
+  res.send('Webhook active');
 });
 
+// ------------------------
+// LINE webhook
+// ------------------------
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
@@ -117,65 +139,36 @@ app.post('/webhook', async (req, res) => {
 
     for (const event of events) {
       if (event.type !== 'message') continue;
-      if (!event.replyToken) continue;
 
       if (event.message.type === 'text') {
-        await replyMessage(
-          event.replyToken,
-          'ส่งรูปสลิปมาได้เลย'
-        );
+        await replyMessage(event.replyToken, 'Send slip image');
         continue;
       }
 
       if (event.message.type === 'image') {
         try {
-          const messageId = event.message.id;
-          console.log('Image message ID:', messageId);
+          const buffer = await getImageBuffer(event.message.id);
+          const result = await verifyWithThunder(buffer);
 
-          const imageBuffer = await getImageBuffer(messageId);
-          console.log('Downloaded bytes:', imageBuffer.length);
+          console.log('Thunder result:', result);
 
-          const qrPayload = await decodeQrFromBuffer(imageBuffer);
-          console.log('QR payload:', qrPayload);
-
-          if (!qrPayload) {
-            await replyMessage(
-              event.replyToken,
-              '❌ อ่าน QR ไม่ได้ กรุณาส่งรูปสลิปที่ชัดกว่านี้'
-            );
-            continue;
-          }
-
-          const thunderResult = await verifyWithThunder(qrPayload);
-          console.log('Thunder result:', JSON.stringify(thunderResult, null, 2));
-
-          const message = formatThunderResult(thunderResult);
-          await replyMessage(event.replyToken, message);
+          await replyMessage(event.replyToken, formatResult(result));
         } catch (err) {
-          console.error('IMAGE FLOW ERROR:', err.response?.data || err.message || err);
+          console.error('ERROR:', err.response?.data || err.message);
 
-          let msg = '❌ ตรวจสอบสลิปไม่ได้ในตอนนี้';
-          if (err.response?.data?.error?.message) {
-            msg = `❌ ${err.response.data.error.message}`;
-          }
-
-          await replyMessage(event.replyToken, msg);
+          await replyMessage(
+            event.replyToken,
+            `❌ ${err.response?.data?.error?.message || 'Error'}`
+          );
         }
-
-        continue;
       }
-
-      await replyMessage(
-        event.replyToken,
-        'กรุณาส่งเป็นรูปสลิป'
-      );
     }
   } catch (err) {
-    console.error('WEBHOOK ERROR:', err.response?.data || err.message || err);
+    console.error('Webhook error:', err);
   }
 });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log('Server running on port', port);
 });
